@@ -71,6 +71,17 @@ NODE_ENV=production PORT=4000 ADMIN_PASSWORD='<mật khẩu mạnh>' npm start
 - **Sao lưu `data/elearning.db` hằng ngày.** Đây là toàn bộ dữ liệu.
 - Trước khi chạy thật, cần nối dịch vụ email trong [`src/lib/mail.ts`](src/lib/mail.ts) (hiện chỉ in email ra terminal).
 
+## Docker
+
+Image được build từ [`Dockerfile`](Dockerfile) gồm 2 bước: build TypeScript, sau đó tạo image chạy chỉ chứa dependency production. Image dùng `node:22-alpine`, chạy bằng user `node`, có healthcheck `/api/health`, và lưu CSDL ở `/app/data` (là volume).
+
+Nên chạy cả dự án bằng [`docker-compose.yml`](../docker-compose.yml) ở thư mục gốc (xem [README gốc](../README.md#chạy-bằng-docker)). Nếu chỉ chạy riêng backend:
+
+```bash
+docker build -t sms-academy-backend .
+docker run -d -p 4000:4000 -v sms-data:/app/data sms-academy-backend
+```
+
 ## Cấu trúc thư mục
 
 ```
