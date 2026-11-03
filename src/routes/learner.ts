@@ -2,7 +2,7 @@
 import { Router } from "express";
 import {
   bestScores, completedLessonIds, completeLesson, enrolledCourseIds, exec, getCourse, listCourses, NOW, one,
-  quizStatus, rows, startLesson, startQuiz, submitQuiz, tx, userCertificates, viewStart,
+  quizStatus, rows, beatLesson, startLesson, startQuiz, submitQuiz, tx, userCertificates,
 } from "../lib/db";
 import { currentTokenHash, me, rateLimited, requireUser } from "../lib/auth";
 import { canAccess, courseOfLesson, courseOfQuizSession } from "../lib/access";
@@ -59,7 +59,7 @@ r.get("/courses/:id", async (req, res) => {
   });
 });
 
-// Học viên mở một bài: ghi nhận thời điểm bắt đầu (và thời lượng video) phía máy chủ.
+// Học viên mở một bài: ghi nhận thời điểm bắt đầu (và thời lượng video), trả về tiến độ đã lưu để học tiếp.
 r.post("/lesson", async (req, res) => {
   const { courseId, lessonId, duration } = req.body ?? {};
   const user = me(req);
@@ -70,17 +70,27 @@ r.post("/lesson", async (req, res) => {
   const done = await completedLessonIds(key(user.id));
   if (data.lessons.some((l) => l.position < lesson.position && !done.has(l.id)))
     return res.status(403).json({ error: "Bài học này đang bị khóa. Hãy hoàn thành các bài trước." });
-  await startLesson(key(user.id), lesson.id, Number(duration) || 0);
-  res.json({ startedMs: await viewStart(key(user.id), lesson.id), now: Date.now() });
+  res.json(await startLesson(key(user.id), lesson.id, Number(duration) || 0));
 });
 
-// Hoàn thành bài: máy chủ kiểm tra thứ tự, thời gian, % video đã xem.
-r.post("/progress", async (req, res) => {
-  const { lessonId, watched } = req.body ?? {};
+// Nhịp báo đang học (khoảng 10 giây/lần): { lessonId, sec, pos, end } → tiến độ mới.
+r.post("/lesson/beat", async (req, res) => {
+  const b = req.body ?? {};
   const user = me(req);
-  const courseId = await courseOfLesson(Number(lessonId));
+  const courseId = await courseOfLesson(Number(b.lessonId));
   if (courseId == null || !(await canAccess(user, courseId))) return res.status(403).json({ error: "Bạn chưa được ghi danh vào khóa học này." });
-  const err = await completeLesson(key(user.id), Number(lessonId), Number(watched) || 0);
+  const view = await beatLesson(key(user.id), Number(b.lessonId), b);
+  if (!view) return res.status(404).json({ error: "Bạn chưa mở bài học này." });
+  res.json(view);
+});
+
+// Hoàn thành bài: máy chủ kiểm tra thứ tự, thời gian đọc, % video đã xem (kèm nhịp cuối cùng).
+r.post("/progress", async (req, res) => {
+  const b = req.body ?? {};
+  const user = me(req);
+  const courseId = await courseOfLesson(Number(b.lessonId));
+  if (courseId == null || !(await canAccess(user, courseId))) return res.status(403).json({ error: "Bạn chưa được ghi danh vào khóa học này." });
+  const err = await completeLesson(key(user.id), Number(b.lessonId), { sec: b.sec, pos: b.pos ?? b.watched, end: b.end });
   if (err) return res.status(400).json({ error: err });
   res.json({ ok: true });
 });

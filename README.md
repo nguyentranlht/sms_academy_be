@@ -131,8 +131,10 @@ src/
 
 **Học bài** (máy chủ kiểm tra, không tin trình duyệt)
 - Học **tuần tự**: phải xong bài trước mới mở được bài sau.
-- Bài **video** (YouTube): phải xem liên tục tới ít nhất **95%** thời lượng, và thời gian từ lúc mở bài phải ≥ 90% thời lượng video.
-- Bài **tài liệu đọc**: phải ở lại tối thiểu một khoảng thời gian, mặc định tính theo tốc độ 200 chữ/phút (tối thiểu 30 giây), quản trị viên có thể đặt riêng.
+- Tiến độ trong bài **lưu ở máy chủ** (bảng `lesson_views`), không lưu trong trình duyệt: đổi máy, đổi trình duyệt vẫn học tiếp; đổi tài khoản không bị lẫn.
+- Trong lúc học, trình duyệt gửi **nhịp** (`/api/lesson/beat`) khoảng 10 giây/lần: số giây vừa học thật (tab đang mở, video đang phát) và vị trí video xa nhất. Máy chủ chỉ cộng tối đa bằng thời gian thực đã trôi qua từ nhịp trước, và vị trí video không được vượt số giây đã xem + 3 giây, nên báo khống hay tua đều không được tính.
+- Bài **video** (YouTube): vị trí đã xem phải tới ít nhất **95%** thời lượng.
+- Bài **tài liệu đọc**: phải cuộn đến cuối và đọc đủ thời gian tối thiểu (chỉ tính lúc tab đang mở), mặc định tính theo tốc độ 200 chữ/phút (tối thiểu 30 giây), quản trị viên có thể đặt riêng.
 
 **Bài kiểm tra**
 - Chỉ làm được sau khi xong tất cả bài học.
@@ -179,8 +181,9 @@ Mọi response là JSON. Lỗi trả về dạng `{ "error": "<thông báo tiế
 |---|---|---|---|
 | GET | `/api/home` | – | Khóa đã ghi danh, tiến độ, điểm cao nhất |
 | GET | `/api/courses/:id` | – | Chi tiết khóa, bài học, bài đã xong, trạng thái thi |
-| POST | `/api/lesson` | `courseId`, `lessonId`, `duration` | Ghi nhận mở bài (và thời lượng video) |
-| POST | `/api/progress` | `lessonId`, `watched` (giây) | Đánh dấu hoàn thành bài |
+| POST | `/api/lesson` | `courseId`, `lessonId`, `duration` | Ghi nhận mở bài (và thời lượng video), trả tiến độ đã lưu `{ activeSec, watchedSec, reachedEnd, duration }` |
+| POST | `/api/lesson/beat` | `lessonId`, `sec`, `pos`, `end` | Nhịp báo đang học, trả tiến độ mới |
+| POST | `/api/progress` | `lessonId`, `sec`, `pos`, `end` (nhịp cuối) | Đánh dấu hoàn thành bài |
 | GET | `/api/quiz` | `?courseId=` | Tạo lượt thi mới |
 | POST | `/api/quiz` | `sessionId`, `answers` (mảng chỉ số đáp án) | Nộp bài, nhận điểm và mã chứng nhận nếu đạt |
 | GET | `/api/certificates` | – | Chứng nhận đã có và khóa còn thiếu |
@@ -250,7 +253,7 @@ Quy ước để API trả dữ liệu giống bản SQLite cũ (frontend dựa 
 | `courses`, `lessons`, `questions` | Khóa học, bài học (video/tài liệu), ngân hàng câu hỏi |
 | `companies`, `activation_codes`, `enrollments` | Doanh nghiệp, mã kích hoạt, ghi danh |
 | `users`, `sessions`, `password_resets` | Tài khoản, phiên đăng nhập, mã quên mật khẩu |
-| `lesson_views`, `progress` | Thời điểm mở bài, bài đã hoàn thành |
+| `lesson_views`, `progress` | Tiến độ trong từng bài (giây đã học, vị trí video, đã cuộn cuối), bài đã hoàn thành |
 | `quiz_sessions`, `quiz_attempts` | Đề đã phát cho từng lượt, kết quả thi |
 | `certificates` | Chứng nhận đã cấp (lưu sẵn tên, khóa, công ty tại thời điểm cấp) |
 

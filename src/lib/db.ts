@@ -100,10 +100,16 @@ const SCHEMA = `
     id ${ID},
     course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
     question TEXT NOT NULL, options JSONB NOT NULL, answer_index INTEGER NOT NULL, explanation TEXT NOT NULL);
-  -- Thời điểm học viên mở bài: dùng để chặn hoàn thành bài quá nhanh.
+  -- Tiến độ trong từng bài, lưu ở máy chủ (đổi máy/trình duyệt vẫn học tiếp được):
+  -- active_sec = số giây thật sự đọc/xem (tab đang mở, video đang phát), watched_sec = vị trí video xa nhất đã xem.
   CREATE TABLE IF NOT EXISTS lesson_views (
     learner TEXT NOT NULL, lesson_id INTEGER NOT NULL REFERENCES lessons(id) ON DELETE CASCADE,
     started_ms BIGINT NOT NULL, duration_sec DOUBLE PRECISION NOT NULL DEFAULT 0, PRIMARY KEY (learner, lesson_id));
+  ALTER TABLE lesson_views
+    ADD COLUMN IF NOT EXISTS active_sec DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS watched_sec DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS reached_end INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS last_beat_ms BIGINT NOT NULL DEFAULT 0;
   CREATE TABLE IF NOT EXISTS progress (
     learner TEXT NOT NULL, lesson_id INTEGER NOT NULL REFERENCES lessons(id) ON DELETE CASCADE,
     completed_at TIMESTAMP(0) NOT NULL DEFAULT ${NOW}, PRIMARY KEY (learner, lesson_id));
@@ -228,44 +234,72 @@ export async function completedLessonIds(learner: string): Promise<Set<number>> 
   return new Set(r.map((x) => x.lesson_id));
 }
 
-/** Ghi nhận học viên mở bài (lần đầu) và thời lượng video nếu có. */
-export async function startLesson(learner: string, lessonId: number, durationSec: number) {
-  await exec("INSERT INTO lesson_views (learner, lesson_id, started_ms) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", [learner, lessonId, Date.now()]);
+/** Tiến độ trong một bài, trả cho trình duyệt để hiện thanh tiến độ. */
+export type LessonView = { activeSec: number; watchedSec: number; reachedEnd: boolean; duration: number };
+type ViewRow = { started_ms: number; duration_sec: number; active_sec: number; watched_sec: number; reached_end: number; last_beat_ms: number };
+const toView = (v: ViewRow): LessonView => ({ activeSec: v.active_sec, watchedSec: v.watched_sec, reachedEnd: !!v.reached_end, duration: v.duration_sec });
+
+const BEAT_MAX = 30; // mỗi nhịp tính tối đa 30 giây
+const SEEK_SLACK = 3; // vị trí video được vượt số giây đã xem tối đa 3 giây (dung sai)
+
+/** Ghi nhận học viên mở bài (lần đầu) và thời lượng video nếu có. Trả về tiến độ đã lưu. */
+export async function startLesson(learner: string, lessonId: number, durationSec: number): Promise<LessonView> {
+  const now = Date.now();
+  await exec("INSERT INTO lesson_views (learner, lesson_id, started_ms, last_beat_ms) VALUES ($1, $2, $3, $3) ON CONFLICT DO NOTHING", [learner, lessonId, now]);
   if (durationSec > 0)
     await exec("UPDATE lesson_views SET duration_sec = $1 WHERE learner = $2 AND lesson_id = $3 AND duration_sec = 0", [durationSec, learner, lessonId]);
+  return toView((await one<ViewRow>("SELECT * FROM lesson_views WHERE learner = $1 AND lesson_id = $2", [learner, lessonId]))!);
 }
 
 /**
- * Hoàn thành bài học — kiểm tra phía máy chủ:
- *  1. Các bài trước phải xong (học tuần tự).
- *  2. Đã mở bài đủ lâu: tài liệu ≥ thời gian đọc tối thiểu, video ≥ 90% thời lượng (dung sai mạng).
- *  3. Video: vị trí đã xem liên tục phải ≥ 95% thời lượng.
+ * Nhịp báo đang học (trình duyệt gửi khoảng 10 giây/lần):
+ *  - sec: số giây vừa đọc/xem thật. Không được cộng quá thời gian thực đã trôi qua từ nhịp trước.
+ *  - pos: vị trí video xa nhất đã xem. Không được vượt số giây đã xem → tua không được tính.
+ *  - end: đã cuộn đến cuối tài liệu.
  */
-export async function completeLesson(learner: string, lessonId: number, watchedSec: number): Promise<string | null> {
+export async function beatLesson(learner: string, lessonId: number, b: { sec?: unknown; pos?: unknown; end?: unknown }): Promise<LessonView | null> {
+  return tx(async (c) => {
+    const v = await one<ViewRow>("SELECT * FROM lesson_views WHERE learner = $1 AND lesson_id = $2 FOR UPDATE", [learner, lessonId], c);
+    if (!v) return null;
+    const now = Date.now();
+    const wall = (now - Math.max(v.last_beat_ms, v.started_ms)) / 1000;
+    const credit = Math.max(0, Math.min(Number(b.sec) || 0, wall + 2, BEAT_MAX));
+    v.active_sec += credit;
+    const pos = Math.min(Number(b.pos) || 0, v.active_sec + SEEK_SLACK, v.duration_sec || Infinity);
+    v.watched_sec = Math.max(v.watched_sec, pos);
+    if (b.end) v.reached_end = 1;
+    v.last_beat_ms = now;
+    await exec("UPDATE lesson_views SET active_sec = $1, watched_sec = $2, reached_end = $3, last_beat_ms = $4 WHERE learner = $5 AND lesson_id = $6", [
+      v.active_sec, v.watched_sec, v.reached_end, now, learner, lessonId,
+    ], c);
+    return toView(v);
+  });
+}
+
+/**
+ * Hoàn thành bài học — kiểm tra phía máy chủ, dựa trên tiến độ đã lưu (b = nhịp cuối cùng):
+ *  1. Các bài trước phải xong (học tuần tự).
+ *  2. Tài liệu: đã cuộn đến cuối và đọc đủ thời gian tối thiểu.
+ *  3. Video: đã xem tới ít nhất 95% thời lượng.
+ */
+export async function completeLesson(learner: string, lessonId: number, b: { sec?: unknown; pos?: unknown; end?: unknown }): Promise<string | null> {
   const lesson = await one<Lesson>("SELECT * FROM lessons WHERE id = $1", [lessonId]);
   if (!lesson) return "Không tìm thấy bài học";
   const data = (await getCourse(lesson.course_id))!;
   const done = await completedLessonIds(learner);
   const prev = data.lessons.filter((l) => l.position < lesson.position);
   if (prev.some((l) => !done.has(l.id))) return "Bạn cần hoàn thành các bài trước theo thứ tự.";
-  const view = await one<{ started_ms: number; duration_sec: number }>("SELECT * FROM lesson_views WHERE learner = $1 AND lesson_id = $2", [learner, lessonId]);
+  const view = await beatLesson(learner, lessonId, b);
   if (!view) return "Bạn chưa mở bài học này.";
-  const elapsed = (Date.now() - view.started_ms) / 1000;
   if (lesson.kind === "reading") {
-    if (elapsed < lesson.min_seconds) return `Bạn cần đọc tối thiểu ${lesson.min_seconds} giây (mới ${Math.floor(elapsed)} giây).`;
+    if (!view.reachedEnd) return "Bạn cần đọc đến cuối tài liệu.";
+    if (view.activeSec < lesson.min_seconds) return `Bạn cần đọc tối thiểu ${lesson.min_seconds} giây (mới ${Math.floor(view.activeSec)} giây).`;
   } else {
-    const dur = view.duration_sec;
-    if (!dur) return "Chưa ghi nhận được thời lượng video. Hãy phát video.";
-    if (watchedSec < dur * VIDEO_REQUIRED) return `Bạn cần xem tối thiểu ${Math.round(VIDEO_REQUIRED * 100)}% video.`;
-    if (elapsed < dur * 0.9) return "Thời gian xem chưa đủ so với thời lượng video.";
+    if (!view.duration) return "Chưa ghi nhận được thời lượng video. Hãy phát video.";
+    if (view.watchedSec < view.duration * VIDEO_REQUIRED) return `Bạn cần xem tối thiểu ${Math.round(VIDEO_REQUIRED * 100)}% video.`;
   }
   await exec("INSERT INTO progress (learner, lesson_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", [learner, lessonId]);
   return null;
-}
-
-export async function viewStart(learner: string, lessonId: number): Promise<number | null> {
-  const v = await one<{ started_ms: number }>("SELECT started_ms FROM lesson_views WHERE learner = $1 AND lesson_id = $2", [learner, lessonId]);
-  return v ? v.started_ms : null;
 }
 
 // ---------- Bài kiểm tra ----------
