@@ -2,24 +2,37 @@
 
 API máy chủ của nền tảng đào tạo trực tuyến SMS Academy: đăng nhập, ghi danh bằng mã kích hoạt, học bài có kiểm soát thời gian, bài kiểm tra chấm phía máy chủ, cấp và tra cứu chứng nhận, báo cáo cho quản trị viên.
 
-- **Công nghệ:** Node.js 22 + Express 4 + TypeScript, CSDL SQLite tích hợp sẵn (`node:sqlite`), không cần cài CSDL riêng.
+- **Công nghệ:** Node.js 22 + Express 5 + TypeScript, CSDL **PostgreSQL** (thư viện `pg`, viết SQL trực tiếp).
 - **Cổng mặc định:** `4000`, mọi API nằm dưới `/api`.
 - **Frontend:** Next.js ở thư mục [`../frontend`](../frontend) chuyển tiếp `/api/*` sang đây. Tổng quan cả dự án xem ở [README gốc](../README.md).
 
 ## Yêu cầu
 
-- Node.js **22.13 trở lên** (cần module `node:sqlite`).
+- Node.js **22 trở lên**.
+- PostgreSQL 14 trở lên. Cách dễ nhất là chạy bằng Docker (bên dưới), không cần cài Postgres vào máy.
 
 ## Chạy trên máy
+
+**Bước 1: bật PostgreSQL** (chạy ở thư mục gốc `sms-academy/`):
+
+```bash
+docker compose up -d db
+```
+
+Lệnh này tạo CSDL `sms_academy`, user `sms`, mật khẩu `sms`, mở cổng `5432` trên máy (chỉ `127.0.0.1`). Nếu máy đã có PostgreSQL khác dùng cổng 5432 (backend báo `password authentication failed for user "sms"`), đặt `DB_PORT=5433` trong file `.env` ở thư mục gốc và `DATABASE_URL=postgres://sms:sms@localhost:5433/sms_academy` trong `backend/.env`.
+
+**Bước 2: chạy backend:**
 
 ```bash
 npm install
 npm run dev        # tsx watch, tự chạy lại khi sửa code
 ```
 
+Mặc định backend kết nối `postgres://sms:sms@localhost:5432/sms_academy`. Dùng Postgres khác thì đặt `DATABASE_URL` trong file `backend/.env` (`npm run dev` tự đọc file này, file đã nằm trong `.gitignore`).
+
 Kiểm tra: mở `http://localhost:4000/api/health` → `{"ok":true}`.
 
-Lần chạy đầu tiên, server tự tạo file `data/elearning.db` và nạp dữ liệu mẫu:
+Lần chạy đầu tiên (CSDL còn trống), server tự tạo bảng và nạp dữ liệu mẫu:
 
 | Dữ liệu | Giá trị |
 |---|---|
@@ -29,7 +42,7 @@ Lần chạy đầu tiên, server tự tạo file `data/elearning.db` và nạp 
 | Mã kích hoạt | `SMS-DEMO-2026` (100 lượt, mở cả 3 khóa mẫu) |
 | Khóa học mẫu | FSSC 22000, Phòng ngừa lao động trẻ em, HACCP – 7 nguyên tắc |
 
-Muốn làm lại từ đầu: dừng server, xóa thư mục `data/` rồi chạy lại.
+Muốn làm lại từ đầu: `docker compose down -v` ở thư mục gốc (xóa luôn dữ liệu Postgres), rồi `docker compose up -d db` và chạy lại backend.
 
 ## Các lệnh
 
@@ -45,14 +58,14 @@ Muốn làm lại từ đầu: dừng server, xóa thư mục `data/` rồi ch�
 | Biến | Mặc định | Ý nghĩa |
 |---|---|---|
 | `PORT` | `4000` | Cổng API |
-| `DATA_DIR` | `./data` | Thư mục chứa `elearning.db` |
+| `DATABASE_URL` | `postgres://sms:sms@localhost:5432/sms_academy` | Chuỗi kết nối PostgreSQL. Mật khẩu có ký tự đặc biệt (`@`, `:`, `/`…) phải mã hóa URL |
 | `NODE_ENV` | – | `production` bật cookie `Secure` và tắt hiện mã xác nhận |
 | `ADMIN_EMAIL`, `ADMIN_PASSWORD` | `admin@sms.vn`, `Admin@2026` | Tài khoản quản trị, **chỉ dùng khi tạo CSDL lần đầu** |
 | `DEMO_SHOW_CODES` | bật khi không phải production | `1`: trả mã quên mật khẩu trong response (`devCode`) để thử nhanh. `0`: tắt |
 | `INSECURE_COOKIE` | – | `1`: bỏ cờ `Secure` của cookie khi chạy production qua http (chỉ thử nội bộ) |
 | `CORS_ORIGIN` | – | Danh sách tên miền được gọi thẳng API, cách nhau dấu phẩy. Không cần nếu chỉ dùng qua frontend |
 
-Dự án không dùng `dotenv`. Nếu muốn đọc từ file `.env`, chạy bằng cờ có sẵn của Node:
+`npm run dev` tự đọc file `.env` (nếu có) bằng cờ `--env-file-if-exists` của Node. Bản build không tự đọc; muốn dùng file `.env` thì chạy:
 
 ```bash
 node --env-file=.env dist/index.js
@@ -68,18 +81,18 @@ NODE_ENV=production PORT=4000 ADMIN_PASSWORD='<mật khẩu mạnh>' npm start
 
 - Backend chỉ cần mở cho frontend, không nên public ra Internet. HTTPS đặt ở Nginx/Caddy phía trước frontend.
 - `app.set("trust proxy", 1)` đã bật để lấy đúng IP khách khi đứng sau 1 lớp proxy.
-- **Sao lưu `data/elearning.db` hằng ngày.** Đây là toàn bộ dữ liệu.
+- **Sao lưu PostgreSQL hằng ngày** bằng `pg_dump` (xem [README gốc](../README.md#chạy-bằng-docker)).
 - Trước khi chạy thật, cần nối dịch vụ email trong [`src/lib/mail.ts`](src/lib/mail.ts) (hiện chỉ in email ra terminal).
 
 ## Docker
 
-Image được build từ [`Dockerfile`](Dockerfile) gồm 2 bước: build TypeScript, sau đó tạo image chạy chỉ chứa dependency production. Image dùng `node:22-alpine`, chạy bằng user `node`, có healthcheck `/api/health`, và lưu CSDL ở `/app/data` (là volume).
+Image được build từ [`Dockerfile`](Dockerfile) gồm 2 bước: build TypeScript, sau đó tạo image chạy chỉ chứa dependency production. Image dùng `node:22-alpine`, chạy bằng user `node` và có healthcheck `/api/health`. Backend không lưu dữ liệu trong container; mọi dữ liệu nằm ở PostgreSQL.
 
 Nên chạy cả dự án bằng [`docker-compose.yml`](../docker-compose.yml) ở thư mục gốc (xem [README gốc](../README.md#chạy-bằng-docker)). Nếu chỉ chạy riêng backend:
 
 ```bash
 docker build -t sms-academy-backend .
-docker run -d -p 4000:4000 -v sms-data:/app/data sms-academy-backend
+docker run -d -p 4000:4000 -e DATABASE_URL=postgres://sms:sms@host.docker.internal:5432/sms_academy sms-academy-backend
 ```
 
 ## Cấu trúc thư mục
@@ -93,17 +106,14 @@ src/
     admin.ts          /api/admin   tổng quan, soạn khóa, công ty & mã, báo cáo, cấp lại mật khẩu
     verify.ts         /api/verify  tra cứu chứng nhận công khai
   lib/
-    db.ts             lược đồ SQLite, nâng cấp CSDL cũ, dữ liệu mẫu, logic học bài / thi / chứng nhận
+    db.ts             kết nối PostgreSQL, lược đồ, dữ liệu mẫu, logic học bài / thi / chứng nhận
     admin.ts          kiểm tra & lưu khóa học, thống kê, báo cáo, công ty, mã kích hoạt
     auth.ts           phiên đăng nhập (cookie), middleware phân quyền, giới hạn số lần thử
     access.ts         kiểm tra học viên có được vào khóa học không
     crypto.ts         băm mật khẩu (scrypt), sinh token/mã, chuẩn hóa số điện thoại
     mail.ts           gửi email (bản demo: in ra terminal)
     seed.ts           3 khóa học mẫu
-data/elearning.db     CSDL (tự tạo, đã nằm trong .gitignore)
 ```
-
-Muốn chuyển sang PostgreSQL: chỉ cần viết lại `lib/db.ts` và `lib/admin.ts`, giữ nguyên tên và kiểu các hàm export; các route không phải sửa.
 
 ## Quy tắc nghiệp vụ
 
@@ -221,7 +231,19 @@ Gửi kèm `id` để sửa bài học / câu hỏi có sẵn; bỏ `id` để t
 
 ## Cơ sở dữ liệu
 
-Lược đồ được tạo tự động trong [`src/lib/db.ts`](src/lib/db.ts) (`CREATE TABLE IF NOT EXISTS`), sau đó chạy `migrate()` để nâng cấp CSDL cũ. Copy file `elearning.db` của bản cũ vào `data/` là dùng được ngay.
+PostgreSQL, kết nối trong [`src/lib/db.ts`](src/lib/db.ts):
+
+- `pool`: nhóm kết nối tạo từ `DATABASE_URL`.
+- `rows(sql, params)`, `one(...)`, `exec(...)`: chạy câu lệnh với tham số `$1, $2…` (không bao giờ ghép chuỗi giá trị vào SQL).
+- `tx(async (c) => …)`: chạy nhiều câu lệnh trong 1 giao dịch; truyền `c` làm tham số cuối của `rows/one/exec`.
+- `initDb()`: gọi khi khởi động, tạo bảng bằng `CREATE TABLE IF NOT EXISTS` và nạp dữ liệu mẫu nếu CSDL trống.
+
+Quy ước để API trả dữ liệu giống bản SQLite cũ (frontend dựa vào):
+
+- Cột thời gian là `TIMESTAMP(0)` lưu **giờ UTC**, trả về chuỗi `"YYYY-MM-DD HH:MM:SS"`. Khi ghi thời điểm hiện tại, dùng hằng `NOW` thay cho `now()`/`CURRENT_TIMESTAMP`.
+- `COUNT(*)`, `BIGINT` trả về số (không phải chuỗi). Cột `DATE` trả về chuỗi `"YYYY-MM-DD"`.
+- `options`, `course_ids`, `payload` là `JSONB`: đọc ra là mảng sẵn, khi ghi truyền `JSON.stringify(...)`.
+- Cờ đúng/sai (`active`, `passed`, `voided`, `submitted`) là `INTEGER` 0/1.
 
 | Bảng | Nội dung |
 |---|---|
@@ -236,5 +258,6 @@ Lược đồ được tạo tự động trong [`src/lib/db.ts`](src/lib/db.ts)
 
 - Email chưa gửi thật: [`src/lib/mail.ts`](src/lib/mail.ts) chỉ in ra terminal. Cần nối SMTP (nodemailer) hoặc SendGrid / Amazon SES.
 - Bộ đếm giới hạn số lần thử nằm trong bộ nhớ: mất khi khởi động lại và không dùng chung được nếu chạy nhiều tiến trình.
-- SQLite phù hợp một máy chủ; muốn chạy nhiều máy cần chuyển sang PostgreSQL.
+- Chưa có công cụ migration: đổi lược đồ bảng đã có thì phải tự viết `ALTER TABLE` (`CREATE TABLE IF NOT EXISTS` chỉ tạo bảng mới).
+- Dữ liệu ở bản SQLite cũ (`data/elearning.db`) không tự chuyển sang PostgreSQL.
 - Chưa có test tự động.

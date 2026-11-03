@@ -1,15 +1,51 @@
-// Lớp dữ liệu dùng SQLite tích hợp sẵn trong Node 22+ (node:sqlite).
-// Khi lên production: thay file này bằng PostgreSQL (vd. Prisma hoặc pg) — giữ nguyên các hàm export.
-import { DatabaseSync } from "node:sqlite";
+// Lớp dữ liệu dùng PostgreSQL (thư viện pg). Kết nối qua biến môi trường DATABASE_URL.
 import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
+import { Pool, types, type PoolClient, type QueryResult } from "pg";
 import { seedCourses, type SeedCourse } from "./seed";
 import { hashPassword } from "./crypto";
 
 export const PASS_RATIO = 0.7; // đạt khi đúng ≥ 70%
 export const VIDEO_REQUIRED = 0.95; // phải xem ≥ 95% thời lượng video
 const READING_WPM = 200; // tốc độ đọc dùng để tính thời gian đọc tối thiểu
+
+// Giữ định dạng dữ liệu trả về như bản SQLite cũ (frontend đang dùng):
+types.setTypeParser(20, (v) => parseInt(v, 10)); // BIGINT, COUNT(*), SUM(): trả số thay vì chuỗi
+types.setTypeParser(1114, (v) => v); // TIMESTAMP: chuỗi "YYYY-MM-DD HH:MM:SS" (giờ UTC)
+types.setTypeParser(1082, (v) => v); // DATE: chuỗi "YYYY-MM-DD"
+
+/** Thời điểm hiện tại theo giờ UTC, dùng cho các cột TIMESTAMP. */
+export const NOW = "(now() AT TIME ZONE 'utc')::timestamp(0)";
+
+export const pool = new Pool({ connectionString: process.env.DATABASE_URL || "postgres://sms:sms@localhost:5432/sms_academy" });
+
+/** Pool hoặc client của một giao dịch (tx). */
+export type Db = { query: (sql: string, params?: unknown[]) => Promise<QueryResult> };
+
+// Câu lệnh dùng tham số $1, $2… Truyền `c` (từ tx) để chạy trong giao dịch.
+export async function rows<T = any>(sql: string, params: unknown[] = [], c: Db = pool): Promise<T[]> {
+  return (await c.query(sql, params)).rows as T[];
+}
+export async function one<T = any>(sql: string, params: unknown[] = [], c: Db = pool): Promise<T | undefined> {
+  return (await rows<T>(sql, params, c))[0];
+}
+/** INSERT/UPDATE/DELETE: trả về số dòng bị ảnh hưởng. */
+export async function exec(sql: string, params: unknown[] = [], c: Db = pool): Promise<number> {
+  return (await c.query(sql, params)).rowCount ?? 0;
+}
+export async function tx<T>(fn: (c: PoolClient) => Promise<T>): Promise<T> {
+  const c = await pool.connect();
+  try {
+    await c.query("BEGIN");
+    const out = await fn(c);
+    await c.query("COMMIT");
+    return out;
+  } catch (e) {
+    await c.query("ROLLBACK");
+    throw e;
+  } finally {
+    c.release();
+  }
+}
 
 export type Course = {
   id: number;
@@ -42,207 +78,161 @@ export type Question = {
   explanation: string;
 };
 
-const g = globalThis as unknown as { __smsDb?: DatabaseSync };
-export const getDb = () => open();
-// node:sqlite trả về object không có prototype; sao chép thành object thường để truyền sang Client Component.
-const plain = <T,>(rows: unknown[]) => rows.map((r) => ({ ...(r as object) })) as T[];
-
 export function readingSeconds(body: string) {
   const words = body.split(/\s+/).filter(Boolean).length;
   return Math.max(30, Math.round((words / READING_WPM) * 60));
 }
 
-function open(): DatabaseSync {
-  if (g.__smsDb) return g.__smsDb;
-  const dir = process.env.DATA_DIR || path.join(process.cwd(), "data");
-  fs.mkdirSync(dir, { recursive: true });
-  const db = new DatabaseSync(path.join(dir, "elearning.db"));
-  db.exec(`
-    PRAGMA foreign_keys = ON;
-    CREATE TABLE IF NOT EXISTS courses (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      title TEXT NOT NULL, category TEXT NOT NULL, level TEXT NOT NULL, description TEXT NOT NULL,
-      quiz_size INTEGER NOT NULL DEFAULT 5, max_attempts INTEGER NOT NULL DEFAULT 3,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP);
-    CREATE TABLE IF NOT EXISTS lessons (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
-      position INTEGER NOT NULL, kind TEXT NOT NULL, title TEXT NOT NULL,
-      youtube_id TEXT NOT NULL DEFAULT '', content TEXT NOT NULL DEFAULT '',
-      body TEXT NOT NULL DEFAULT '', min_seconds INTEGER NOT NULL DEFAULT 0);
-    CREATE TABLE IF NOT EXISTS questions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
-      question TEXT NOT NULL, options TEXT NOT NULL, answer_index INTEGER NOT NULL, explanation TEXT NOT NULL);
-    -- Thời điểm học viên mở bài: dùng để chặn hoàn thành bài quá nhanh.
-    CREATE TABLE IF NOT EXISTS lesson_views (
-      learner TEXT NOT NULL, lesson_id INTEGER NOT NULL REFERENCES lessons(id) ON DELETE CASCADE,
-      started_ms INTEGER NOT NULL, duration_sec REAL NOT NULL DEFAULT 0, PRIMARY KEY (learner, lesson_id));
-    CREATE TABLE IF NOT EXISTS progress (
-      learner TEXT NOT NULL, lesson_id INTEGER NOT NULL REFERENCES lessons(id) ON DELETE CASCADE,
-      completed_at TEXT DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (learner, lesson_id));
-    -- Mỗi lượt thi: câu hỏi được rút ngẫu nhiên và xáo trộn đáp án, lưu lại để chấm.
-    CREATE TABLE IF NOT EXISTS quiz_sessions (
-      id TEXT PRIMARY KEY, learner TEXT NOT NULL,
-      course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
-      payload TEXT NOT NULL, submitted INTEGER NOT NULL DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
-    CREATE TABLE IF NOT EXISTS quiz_attempts (
-      id INTEGER PRIMARY KEY AUTOINCREMENT, learner TEXT NOT NULL,
-      course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
-      score INTEGER NOT NULL, total INTEGER NOT NULL, passed INTEGER NOT NULL,
-      voided INTEGER NOT NULL DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
-    -- Tài khoản, doanh nghiệp, mã kích hoạt, chứng nhận
-    CREATE TABLE IF NOT EXISTS companies (
-      id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, tax_code TEXT NOT NULL DEFAULT '',
-      contact TEXT NOT NULL DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP);
-    CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE COLLATE NOCASE,
-      password_hash TEXT NOT NULL, name TEXT NOT NULL, cert_name TEXT NOT NULL DEFAULT '',
-      phone TEXT NOT NULL DEFAULT '', department TEXT NOT NULL DEFAULT '',
-      company_id INTEGER REFERENCES companies(id) ON DELETE SET NULL,
-      role TEXT NOT NULL DEFAULT 'learner', password_changed_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP);
-    CREATE TABLE IF NOT EXISTS sessions (
-      token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      expires_ms INTEGER NOT NULL, user_agent TEXT NOT NULL DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP);
-    CREATE TABLE IF NOT EXISTS activation_codes (
-      code TEXT PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      label TEXT NOT NULL DEFAULT '', course_ids TEXT NOT NULL, max_uses INTEGER NOT NULL,
-      used INTEGER NOT NULL DEFAULT 0, expires_at TEXT, active INTEGER NOT NULL DEFAULT 1,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP);
-    CREATE TABLE IF NOT EXISTS enrollments (
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
-      code TEXT, enrolled_at TEXT DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (user_id, course_id));
-    CREATE TABLE IF NOT EXISTS password_resets (
-      email TEXT NOT NULL COLLATE NOCASE PRIMARY KEY, code_hash TEXT NOT NULL,
-      expires_ms INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, sent_ms INTEGER NOT NULL);
-    CREATE TABLE IF NOT EXISTS certificates (
-      code TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
-      holder_name TEXT NOT NULL, course_title TEXT NOT NULL, company_name TEXT NOT NULL DEFAULT '',
-      score INTEGER NOT NULL, total INTEGER NOT NULL, issued_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE (user_id, course_id));
-  `);
-  migrate(db);
-  g.__smsDb = db;
-  const n = db.prepare("SELECT COUNT(*) AS n FROM courses").get() as { n: number };
-  if (n.n === 0) seed(db);
-  return db;
-}
+const ID = "INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY";
+const CREATED = `created_at TIMESTAMP(0) NOT NULL DEFAULT ${NOW}`;
+const SCHEMA = `
+  CREATE TABLE IF NOT EXISTS courses (
+    id ${ID},
+    title TEXT NOT NULL, category TEXT NOT NULL, level TEXT NOT NULL, description TEXT NOT NULL,
+    quiz_size INTEGER NOT NULL DEFAULT 5, max_attempts INTEGER NOT NULL DEFAULT 3, ${CREATED});
+  CREATE TABLE IF NOT EXISTS lessons (
+    id ${ID},
+    course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL, kind TEXT NOT NULL, title TEXT NOT NULL,
+    youtube_id TEXT NOT NULL DEFAULT '', content TEXT NOT NULL DEFAULT '',
+    body TEXT NOT NULL DEFAULT '', min_seconds INTEGER NOT NULL DEFAULT 0);
+  CREATE TABLE IF NOT EXISTS questions (
+    id ${ID},
+    course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+    question TEXT NOT NULL, options JSONB NOT NULL, answer_index INTEGER NOT NULL, explanation TEXT NOT NULL);
+  -- Thời điểm học viên mở bài: dùng để chặn hoàn thành bài quá nhanh.
+  CREATE TABLE IF NOT EXISTS lesson_views (
+    learner TEXT NOT NULL, lesson_id INTEGER NOT NULL REFERENCES lessons(id) ON DELETE CASCADE,
+    started_ms BIGINT NOT NULL, duration_sec DOUBLE PRECISION NOT NULL DEFAULT 0, PRIMARY KEY (learner, lesson_id));
+  CREATE TABLE IF NOT EXISTS progress (
+    learner TEXT NOT NULL, lesson_id INTEGER NOT NULL REFERENCES lessons(id) ON DELETE CASCADE,
+    completed_at TIMESTAMP(0) NOT NULL DEFAULT ${NOW}, PRIMARY KEY (learner, lesson_id));
+  -- Mỗi lượt thi: câu hỏi được rút ngẫu nhiên và xáo trộn đáp án, lưu lại để chấm.
+  CREATE TABLE IF NOT EXISTS quiz_sessions (
+    id TEXT PRIMARY KEY, learner TEXT NOT NULL,
+    course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+    payload JSONB NOT NULL, submitted INTEGER NOT NULL DEFAULT 0, ${CREATED});
+  CREATE TABLE IF NOT EXISTS quiz_attempts (
+    id ${ID}, learner TEXT NOT NULL,
+    course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+    score INTEGER NOT NULL, total INTEGER NOT NULL, passed INTEGER NOT NULL,
+    voided INTEGER NOT NULL DEFAULT 0, ${CREATED});
+  -- Tài khoản, doanh nghiệp, mã kích hoạt, chứng nhận
+  CREATE TABLE IF NOT EXISTS companies (
+    id ${ID}, name TEXT NOT NULL, tax_code TEXT NOT NULL DEFAULT '',
+    contact TEXT NOT NULL DEFAULT '', ${CREATED});
+  -- Email luôn lưu chữ thường. Công nhân đăng ký bằng số điện thoại có thể không có email.
+  CREATE TABLE IF NOT EXISTS users (
+    id ${ID}, email TEXT UNIQUE,
+    password_hash TEXT NOT NULL, name TEXT NOT NULL, cert_name TEXT NOT NULL DEFAULT '',
+    phone TEXT NOT NULL DEFAULT '', department TEXT NOT NULL DEFAULT '',
+    company_id INTEGER REFERENCES companies(id) ON DELETE SET NULL,
+    role TEXT NOT NULL DEFAULT 'learner', password_changed_at TIMESTAMP(0) NOT NULL DEFAULT ${NOW}, ${CREATED});
+  -- Số điện thoại dùng để đăng nhập nên không được trùng.
+  CREATE UNIQUE INDEX IF NOT EXISTS users_phone ON users(phone) WHERE phone <> '';
+  CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_ms BIGINT NOT NULL, user_agent TEXT NOT NULL DEFAULT '', ${CREATED});
+  CREATE TABLE IF NOT EXISTS activation_codes (
+    code TEXT PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    label TEXT NOT NULL DEFAULT '', course_ids JSONB NOT NULL, max_uses INTEGER NOT NULL,
+    used INTEGER NOT NULL DEFAULT 0, expires_at DATE, active INTEGER NOT NULL DEFAULT 1, ${CREATED});
+  CREATE TABLE IF NOT EXISTS enrollments (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+    code TEXT, enrolled_at TIMESTAMP(0) NOT NULL DEFAULT ${NOW}, PRIMARY KEY (user_id, course_id));
+  CREATE TABLE IF NOT EXISTS password_resets (
+    email TEXT PRIMARY KEY, code_hash TEXT NOT NULL,
+    expires_ms BIGINT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, sent_ms BIGINT NOT NULL);
+  CREATE TABLE IF NOT EXISTS certificates (
+    code TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+    holder_name TEXT NOT NULL, course_title TEXT NOT NULL, company_name TEXT NOT NULL DEFAULT '',
+    score INTEGER NOT NULL, total INTEGER NOT NULL, issued_at TIMESTAMP(0) NOT NULL DEFAULT ${NOW},
+    UNIQUE (user_id, course_id));
+`;
 
-// Nâng cấp CSDL cũ: cho phép tài khoản không có email (công nhân đăng ký bằng số điện thoại).
-function migrate(db: DatabaseSync) {
-  const cols = db.prepare("PRAGMA table_info(users)").all() as { name: string; notnull: number }[];
-  if (cols.find((c) => c.name === "email")?.notnull) {
-    db.exec(`
-      PRAGMA foreign_keys = OFF;
-      BEGIN;
-      CREATE TABLE users_new (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE COLLATE NOCASE,
-        password_hash TEXT NOT NULL, name TEXT NOT NULL, cert_name TEXT NOT NULL DEFAULT '',
-        phone TEXT NOT NULL DEFAULT '', department TEXT NOT NULL DEFAULT '',
-        company_id INTEGER REFERENCES companies(id) ON DELETE SET NULL,
-        role TEXT NOT NULL DEFAULT 'learner', password_changed_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP);
-      INSERT INTO users_new SELECT id, email, password_hash, name, cert_name, phone, department, company_id, role, password_changed_at, created_at FROM users;
-      DROP TABLE users;
-      ALTER TABLE users_new RENAME TO users;
-      COMMIT;
-      PRAGMA foreign_keys = ON;
-    `);
-  }
-  // Số điện thoại dùng để đăng nhập nên không được trùng.
-  try {
-    db.exec("CREATE UNIQUE INDEX IF NOT EXISTS users_phone ON users(phone) WHERE phone != ''");
-  } catch {
-    // Dữ liệu cũ có số trùng: bỏ qua, kiểm tra trùng vẫn được làm khi đăng ký.
-  }
+/** Tạo bảng (nếu chưa có) và dữ liệu mẫu khi CSDL còn trống. Gọi một lần lúc khởi động. */
+export async function initDb() {
+  await tx(async (c) => {
+    await c.query("SELECT pg_advisory_xact_lock(20260001)"); // nhiều tiến trình khởi động cùng lúc: chỉ 1 tiến trình tạo bảng
+    await c.query(SCHEMA);
+    const n = await one<{ n: number }>("SELECT COUNT(*) AS n FROM courses", [], c);
+    if (n!.n === 0) await seed(c);
+  });
 }
 
 // Dữ liệu ban đầu: khóa mẫu, 1 tài khoản quản trị, 1 công ty demo với mã kích hoạt, 1 học viên demo.
-function seed(db: DatabaseSync) {
-  const ids = seedCourses.map((c) => createCourse(c));
-  const adminEmail = process.env.ADMIN_EMAIL || "admin@sms.vn";
+async function seed(c: Db) {
+  const ids: number[] = [];
+  for (const s of seedCourses) ids.push(await createCourse(s, c));
+  const adminEmail = (process.env.ADMIN_EMAIL || "admin@sms.vn").toLowerCase();
   const adminPass = process.env.ADMIN_PASSWORD || "Admin@2026";
-  db.prepare("INSERT INTO users (email, password_hash, name, role) VALUES (?, ?, ?, 'admin')").run(adminEmail, hashPassword(adminPass), "Quản trị SMS");
-  const co = Number(db.prepare("INSERT INTO companies (name, contact) VALUES (?, ?)").run("Công ty Demo", "Phòng nhân sự").lastInsertRowid);
-  db.prepare("INSERT INTO activation_codes (code, company_id, label, course_ids, max_uses) VALUES (?, ?, ?, ?, ?)").run(
-    "SMS-DEMO-2026", co, "Đợt demo", JSON.stringify(ids), 100
-  );
-  const u = Number(
-    db.prepare("INSERT INTO users (email, password_hash, name, cert_name, department, company_id, phone) VALUES (?, ?, ?, ?, ?, ?, '0901234567')").run(
-      "hocvien@demo.vn", hashPassword("Hocvien@2026"), "Nguyễn Thị Mai", "NGUYỄN THỊ MAI", "QA", co
-    ).lastInsertRowid
-  );
-  for (const id of ids) db.prepare("INSERT INTO enrollments (user_id, course_id, code) VALUES (?, ?, ?)").run(u, id, "SMS-DEMO-2026");
-  db.prepare("UPDATE activation_codes SET used = 1 WHERE code = 'SMS-DEMO-2026'").run();
+  await exec("INSERT INTO users (email, password_hash, name, role) VALUES ($1, $2, $3, 'admin')", [adminEmail, hashPassword(adminPass), "Quản trị SMS"], c);
+  const co = (await one<{ id: number }>("INSERT INTO companies (name, contact) VALUES ($1, $2) RETURNING id", ["Công ty Demo", "Phòng nhân sự"], c))!.id;
+  await exec("INSERT INTO activation_codes (code, company_id, label, course_ids, max_uses, used) VALUES ($1, $2, $3, $4, $5, 1)", [
+    "SMS-DEMO-2026", co, "Đợt demo", JSON.stringify(ids), 100,
+  ], c);
+  const u = (await one<{ id: number }>(
+    "INSERT INTO users (email, password_hash, name, cert_name, department, company_id, phone) VALUES ($1, $2, $3, $4, $5, $6, '0901234567') RETURNING id",
+    ["hocvien@demo.vn", hashPassword("Hocvien@2026"), "Nguyễn Thị Mai", "NGUYỄN THỊ MAI", "QA", co],
+    c
+  ))!.id;
+  for (const id of ids) await exec("INSERT INTO enrollments (user_id, course_id, code) VALUES ($1, $2, $3)", [u, id, "SMS-DEMO-2026"], c);
 }
 
 // ---------- Khóa học ----------
-export function listCourses(): Course[] {
-  return plain<Course>(
-    open()
-      .prepare(
-        `SELECT c.*, (SELECT COUNT(*) FROM lessons l WHERE l.course_id = c.id) AS lessonCount,
-                (SELECT COUNT(*) FROM questions q WHERE q.course_id = c.id) AS questionCount
-         FROM courses c ORDER BY c.id`
-      )
-      .all()
+export function listCourses(): Promise<Course[]> {
+  return rows<Course>(
+    `SELECT c.*, (SELECT COUNT(*) FROM lessons l WHERE l.course_id = c.id) AS "lessonCount",
+            (SELECT COUNT(*) FROM questions q WHERE q.course_id = c.id) AS "questionCount"
+     FROM courses c ORDER BY c.id`
   );
 }
 
-export function getCourse(id: number) {
-  const db = open();
-  const row = db.prepare("SELECT * FROM courses WHERE id = ?").get(id);
-  if (!row) return null;
-  const course = { ...row } as unknown as Course;
-  const lessons = plain<Lesson>(db.prepare("SELECT * FROM lessons WHERE course_id = ? ORDER BY position").all(id));
-  const questions = plain<any>(db.prepare("SELECT * FROM questions WHERE course_id = ? ORDER BY id").all(id)).map((q) => ({
-    ...q,
-    options: JSON.parse(q.options),
-  })) as Question[];
+export async function getCourse(id: number, c: Db = pool) {
+  if (!Number.isSafeInteger(id)) return null;
+  const course = await one<Course>("SELECT * FROM courses WHERE id = $1", [id], c);
+  if (!course) return null;
+  const lessons = await rows<Lesson>("SELECT * FROM lessons WHERE course_id = $1 ORDER BY position", [id], c);
+  const questions = await rows<Question>("SELECT * FROM questions WHERE course_id = $1 ORDER BY id", [id], c);
   return { course, lessons, questions };
 }
 
-export function createCourse(c: SeedCourse): number {
-  const db = open();
-  const r = db
-    .prepare("INSERT INTO courses (title, category, level, description, quiz_size, max_attempts) VALUES (?, ?, ?, ?, ?, ?)")
-    .run(c.title, c.category, c.level, c.description, c.quizSize, c.maxAttempts);
-  const id = Number(r.lastInsertRowid);
-  const insL = db.prepare(
-    "INSERT INTO lessons (course_id, position, kind, title, youtube_id, content, body, min_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-  );
-  c.lessons.forEach((l, i) =>
-    insL.run(
-      id, i + 1, l.kind, l.title, l.youtubeId ?? "", l.content ?? "", l.body ?? "",
-      l.kind === "reading" ? l.minSeconds || readingSeconds(l.body ?? "") : 0
-    )
-  );
-  const insQ = db.prepare("INSERT INTO questions (course_id, question, options, answer_index, explanation) VALUES (?, ?, ?, ?, ?)");
-  c.questions.forEach((q) => insQ.run(id, q.question, JSON.stringify(q.options), q.answer, q.explanation));
+export async function createCourse(s: SeedCourse, c: Db = pool): Promise<number> {
+  const id = (await one<{ id: number }>(
+    "INSERT INTO courses (title, category, level, description, quiz_size, max_attempts) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+    [s.title, s.category, s.level, s.description, s.quizSize, s.maxAttempts],
+    c
+  ))!.id;
+  for (const [i, l] of s.lessons.entries())
+    await exec(
+      "INSERT INTO lessons (course_id, position, kind, title, youtube_id, content, body, min_seconds) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+      [id, i + 1, l.kind, l.title, l.youtubeId ?? "", l.content ?? "", l.body ?? "", l.kind === "reading" ? l.minSeconds || readingSeconds(l.body ?? "") : 0],
+      c
+    );
+  for (const q of s.questions)
+    await exec("INSERT INTO questions (course_id, question, options, answer_index, explanation) VALUES ($1, $2, $3, $4, $5)", [
+      id, q.question, JSON.stringify(q.options), q.answer, q.explanation,
+    ], c);
   return id;
 }
 
-export function deleteCourse(id: number) {
-  open().prepare("DELETE FROM courses WHERE id = ?").run(id);
+export async function deleteCourse(id: number) {
+  await exec("DELETE FROM courses WHERE id = $1", [id]);
 }
 
 // ---------- Tiến độ ----------
-export function completedLessonIds(learner: string): Set<number> {
-  const rows = plain<{ lesson_id: number }>(open().prepare("SELECT lesson_id FROM progress WHERE learner = ?").all(learner));
-  return new Set(rows.map((r) => r.lesson_id));
+export async function completedLessonIds(learner: string): Promise<Set<number>> {
+  const r = await rows<{ lesson_id: number }>("SELECT lesson_id FROM progress WHERE learner = $1", [learner]);
+  return new Set(r.map((x) => x.lesson_id));
 }
 
 /** Ghi nhận học viên mở bài (lần đầu) và thời lượng video nếu có. */
-export function startLesson(learner: string, lessonId: number, durationSec: number) {
-  const db = open();
-  db.prepare("INSERT OR IGNORE INTO lesson_views (learner, lesson_id, started_ms) VALUES (?, ?, ?)").run(learner, lessonId, Date.now());
+export async function startLesson(learner: string, lessonId: number, durationSec: number) {
+  await exec("INSERT INTO lesson_views (learner, lesson_id, started_ms) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", [learner, lessonId, Date.now()]);
   if (durationSec > 0)
-    db.prepare("UPDATE lesson_views SET duration_sec = ? WHERE learner = ? AND lesson_id = ? AND duration_sec = 0").run(
-      durationSec, learner, lessonId
-    );
+    await exec("UPDATE lesson_views SET duration_sec = $1 WHERE learner = $2 AND lesson_id = $3 AND duration_sec = 0", [durationSec, learner, lessonId]);
 }
 
 /**
@@ -251,17 +241,14 @@ export function startLesson(learner: string, lessonId: number, durationSec: numb
  *  2. Đã mở bài đủ lâu: tài liệu ≥ thời gian đọc tối thiểu, video ≥ 90% thời lượng (dung sai mạng).
  *  3. Video: vị trí đã xem liên tục phải ≥ 95% thời lượng.
  */
-export function completeLesson(learner: string, lessonId: number, watchedSec: number): string | null {
-  const db = open();
-  const lesson = db.prepare("SELECT * FROM lessons WHERE id = ?").get(lessonId) as unknown as Lesson | undefined;
+export async function completeLesson(learner: string, lessonId: number, watchedSec: number): Promise<string | null> {
+  const lesson = await one<Lesson>("SELECT * FROM lessons WHERE id = $1", [lessonId]);
   if (!lesson) return "Không tìm thấy bài học";
-  const data = getCourse(lesson.course_id)!;
-  const done = completedLessonIds(learner);
+  const data = (await getCourse(lesson.course_id))!;
+  const done = await completedLessonIds(learner);
   const prev = data.lessons.filter((l) => l.position < lesson.position);
   if (prev.some((l) => !done.has(l.id))) return "Bạn cần hoàn thành các bài trước theo thứ tự.";
-  const view = db.prepare("SELECT * FROM lesson_views WHERE learner = ? AND lesson_id = ?").get(learner, lessonId) as
-    | { started_ms: number; duration_sec: number }
-    | undefined;
+  const view = await one<{ started_ms: number; duration_sec: number }>("SELECT * FROM lesson_views WHERE learner = $1 AND lesson_id = $2", [learner, lessonId]);
   if (!view) return "Bạn chưa mở bài học này.";
   const elapsed = (Date.now() - view.started_ms) / 1000;
   if (lesson.kind === "reading") {
@@ -272,31 +259,29 @@ export function completeLesson(learner: string, lessonId: number, watchedSec: nu
     if (watchedSec < dur * VIDEO_REQUIRED) return `Bạn cần xem tối thiểu ${Math.round(VIDEO_REQUIRED * 100)}% video.`;
     if (elapsed < dur * 0.9) return "Thời gian xem chưa đủ so với thời lượng video.";
   }
-  db.prepare("INSERT OR IGNORE INTO progress (learner, lesson_id) VALUES (?, ?)").run(learner, lessonId);
+  await exec("INSERT INTO progress (learner, lesson_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", [learner, lessonId]);
   return null;
 }
 
-export function viewStart(learner: string, lessonId: number): number | null {
-  const v = open().prepare("SELECT started_ms FROM lesson_views WHERE learner = ? AND lesson_id = ?").get(learner, lessonId) as
-    | { started_ms: number }
-    | undefined;
+export async function viewStart(learner: string, lessonId: number): Promise<number | null> {
+  const v = await one<{ started_ms: number }>("SELECT started_ms FROM lesson_views WHERE learner = $1 AND lesson_id = $2", [learner, lessonId]);
   return v ? v.started_ms : null;
 }
 
 // ---------- Bài kiểm tra ----------
-export function quizStatus(learner: string, courseId: number) {
-  const db = open();
-  const c = db.prepare("SELECT max_attempts FROM courses WHERE id = ?").get(courseId) as { max_attempts: number };
-  const rows = plain<{ score: number; total: number; passed: number; voided: number }>(
-    db.prepare("SELECT score, total, passed, voided FROM quiz_attempts WHERE learner = ? AND course_id = ? ORDER BY id").all(learner, courseId)
+export async function quizStatus(learner: string, courseId: number) {
+  const c = (await one<{ max_attempts: number }>("SELECT max_attempts FROM courses WHERE id = $1", [courseId]))!;
+  const r = await rows<{ score: number; total: number; passed: number; voided: number }>(
+    "SELECT score, total, passed, voided FROM quiz_attempts WHERE learner = $1 AND course_id = $2 ORDER BY id",
+    [learner, courseId]
   );
-  const active = rows.filter((r) => !r.voided);
-  const fails = active.filter((r) => !r.passed).length;
-  const best = rows.reduce<{ score: number; total: number } | null>(
-    (b, r) => (!b || r.score / r.total > b.score / b.total ? { score: r.score, total: r.total } : b),
+  const active = r.filter((x) => !x.voided);
+  const fails = active.filter((x) => !x.passed).length;
+  const best = r.reduce<{ score: number; total: number } | null>(
+    (b, x) => (!b || x.score / x.total > b.score / b.total ? { score: x.score, total: x.total } : b),
     null
   );
-  return { passed: rows.some((r) => r.passed), attemptsLeft: Math.max(0, c.max_attempts - fails), maxAttempts: c.max_attempts, best };
+  return { passed: r.some((x) => x.passed), attemptsLeft: Math.max(0, c.max_attempts - fails), maxAttempts: c.max_attempts, best };
 }
 
 function shuffle<T>(a: T[]): T[] {
@@ -309,17 +294,17 @@ function shuffle<T>(a: T[]): T[] {
 }
 
 /** Tạo một lượt thi: rút ngẫu nhiên câu hỏi từ ngân hàng và xáo trộn thứ tự đáp án. */
-export function startQuiz(learner: string, courseId: number) {
-  const data = getCourse(courseId);
+export async function startQuiz(learner: string, courseId: number) {
+  const data = await getCourse(courseId);
   if (!data) return { error: "Không tìm thấy khóa học" };
-  const done = completedLessonIds(learner);
+  const done = await completedLessonIds(learner);
   if (data.lessons.some((l) => !done.has(l.id))) return { error: "Bạn cần hoàn thành tất cả bài học trước khi làm bài kiểm tra." };
-  const st = quizStatus(learner, courseId);
+  const st = await quizStatus(learner, courseId);
   if (st.attemptsLeft <= 0) return { error: "Bạn đã hết lượt thi." };
   const picked = shuffle(data.questions).slice(0, Math.min(data.course.quiz_size, data.questions.length));
   const items = picked.map((q) => ({ qid: q.id, order: shuffle(q.options.map((_, i) => i)) }));
   const id = crypto.randomUUID();
-  open().prepare("INSERT INTO quiz_sessions (id, learner, course_id, payload) VALUES (?, ?, ?, ?)").run(id, learner, courseId, JSON.stringify(items));
+  await exec("INSERT INTO quiz_sessions (id, learner, course_id, payload) VALUES ($1, $2, $3, $4)", [id, learner, courseId, JSON.stringify(items)]);
   return {
     sessionId: id,
     questions: items.map((it) => {
@@ -333,18 +318,20 @@ export function startQuiz(learner: string, courseId: number) {
  * Chấm bài. Khi trượt: chỉ báo câu nào sai, KHÔNG tiết lộ đáp án đúng (chống học vẹt).
  * Trượt hết số lượt cho phép → xóa tiến độ khóa học, học viên phải học lại từ đầu.
  */
-export function submitQuiz(learner: string, sessionId: string, answers: number[]) {
-  const db = open();
-  const s = db.prepare("SELECT * FROM quiz_sessions WHERE id = ? AND learner = ?").get(sessionId, learner) as
-    | { course_id: number; payload: string; submitted: number }
-    | undefined;
-  if (!s) return { error: "Không tìm thấy lượt thi" };
-  if (s.submitted) return { error: "Lượt thi này đã nộp." };
-  const items = JSON.parse(s.payload) as { qid: number; order: number[] }[];
-  const data = getCourse(s.course_id)!;
+export async function submitQuiz(learner: string, sessionId: string, answers: number[]) {
+  // Đánh dấu đã nộp ngay trong 1 câu lệnh: nộp 2 lần cùng lúc thì chỉ 1 lần được chấm.
+  const s = await one<{ course_id: number; payload: { qid: number; order: number[] }[] }>(
+    "UPDATE quiz_sessions SET submitted = 1 WHERE id = $1 AND learner = $2 AND submitted = 0 RETURNING course_id, payload",
+    [sessionId, learner]
+  );
+  if (!s) {
+    const exists = await one("SELECT 1 FROM quiz_sessions WHERE id = $1 AND learner = $2", [sessionId, learner]);
+    return { error: exists ? "Lượt thi này đã nộp." : "Không tìm thấy lượt thi" };
+  }
+  const items = s.payload;
+  const data = (await getCourse(s.course_id))!;
   if (items.some((it) => !data.questions.some((x) => x.id === it.qid))) {
     // Quản trị viên vừa sửa ngân hàng câu hỏi: hủy lượt này, không tính lượt thi.
-    db.prepare("UPDATE quiz_sessions SET submitted = 1 WHERE id = ?").run(sessionId);
     return { error: "Đề thi vừa được cập nhật. Hãy bắt đầu lại bài kiểm tra (lượt này không bị tính)." };
   }
   const results = items.map((it, i) => {
@@ -354,21 +341,20 @@ export function submitQuiz(learner: string, sessionId: string, answers: number[]
   });
   const score = results.filter((r) => r.correct).length;
   const passed = score / results.length >= PASS_RATIO;
-  db.prepare("UPDATE quiz_sessions SET submitted = 1 WHERE id = ?").run(sessionId);
-  db.prepare("INSERT INTO quiz_attempts (learner, course_id, score, total, passed) VALUES (?, ?, ?, ?, ?)").run(
-    learner, s.course_id, score, results.length, passed ? 1 : 0
-  );
+  await exec("INSERT INTO quiz_attempts (learner, course_id, score, total, passed) VALUES ($1, $2, $3, $4, $5)", [
+    learner, s.course_id, score, results.length, passed ? 1 : 0,
+  ]);
   let certificate: string | null = null;
-  if (passed) certificate = issueCertificate(Number(learner), s.course_id, score, results.length);
+  if (passed) certificate = await issueCertificate(Number(learner), s.course_id, score, results.length);
   let reset = false;
-  if (!passed && quizStatus(learner, s.course_id).attemptsLeft <= 0) {
+  if (!passed && (await quizStatus(learner, s.course_id)).attemptsLeft <= 0) {
     // Hết lượt: hủy tiến độ để buộc học lại.
     const ids = data.lessons.map((l) => l.id);
-    for (const id of ids) {
-      db.prepare("DELETE FROM progress WHERE learner = ? AND lesson_id = ?").run(learner, id);
-      db.prepare("DELETE FROM lesson_views WHERE learner = ? AND lesson_id = ?").run(learner, id);
-    }
-    db.prepare("UPDATE quiz_attempts SET voided = 1 WHERE learner = ? AND course_id = ?").run(learner, s.course_id);
+    await tx(async (c) => {
+      await exec("DELETE FROM progress WHERE learner = $1 AND lesson_id = ANY($2::int[])", [learner, ids], c);
+      await exec("DELETE FROM lesson_views WHERE learner = $1 AND lesson_id = ANY($2::int[])", [learner, ids], c);
+      await exec("UPDATE quiz_attempts SET voided = 1 WHERE learner = $1 AND course_id = $2", [learner, s.course_id], c);
+    });
     reset = true;
   }
   return {
@@ -377,76 +363,76 @@ export function submitQuiz(learner: string, sessionId: string, answers: number[]
     passed,
     reset,
     certificate,
-    attemptsLeft: quizStatus(learner, s.course_id).attemptsLeft,
+    attemptsLeft: (await quizStatus(learner, s.course_id)).attemptsLeft,
     results: results.map((r) => (passed ? r : { correct: r.correct })),
   };
 }
 
-export function bestScores(learner: string): Map<number, { score: number; total: number; passed: boolean }> {
-  const rows = plain<{ course_id: number; score: number; total: number; passed: number }>(
-    open()
-      .prepare(
-        `SELECT course_id, score, total, passed FROM quiz_attempts a WHERE learner = ?
-         AND id = (SELECT id FROM quiz_attempts b WHERE b.learner = a.learner AND b.course_id = a.course_id
-                   ORDER BY CAST(score AS REAL) / total DESC, id LIMIT 1)`
-      )
-      .all(learner)
+export async function bestScores(learner: string): Promise<Map<number, { score: number; total: number; passed: boolean }>> {
+  const r = await rows<{ course_id: number; score: number; total: number; passed: number }>(
+    `SELECT course_id, score, total, passed FROM quiz_attempts a WHERE learner = $1
+     AND id = (SELECT id FROM quiz_attempts b WHERE b.learner = a.learner AND b.course_id = a.course_id
+               ORDER BY CAST(score AS REAL) / total DESC, id LIMIT 1)`,
+    [learner]
   );
-  return new Map(rows.map((r) => [Number(r.course_id), { score: r.score, total: r.total, passed: !!r.passed }]));
+  return new Map(r.map((x) => [x.course_id, { score: x.score, total: x.total, passed: !!x.passed }]));
 }
 
 export function learnerReport() {
-  return plain<{ learner: string; lessons_done: number; attempts: number; passed: number }>(
-    open()
-      .prepare(
-        `SELECT learner, COUNT(*) AS lessons_done,
-          (SELECT COUNT(*) FROM quiz_attempts q WHERE q.learner = p.learner) AS attempts,
-          (SELECT COUNT(DISTINCT course_id) FROM quiz_attempts q WHERE q.learner = p.learner AND q.passed = 1) AS passed
-         FROM progress p GROUP BY learner ORDER BY lessons_done DESC`
-      )
-      .all()
+  return rows<{ learner: string; lessons_done: number; attempts: number; passed: number }>(
+    `SELECT learner, COUNT(*) AS lessons_done,
+      (SELECT COUNT(*) FROM quiz_attempts q WHERE q.learner = p.learner) AS attempts,
+      (SELECT COUNT(DISTINCT course_id) FROM quiz_attempts q WHERE q.learner = p.learner AND q.passed = 1) AS passed
+     FROM progress p GROUP BY learner ORDER BY lessons_done DESC`
   );
 }
 
 // ---------- Chứng nhận ----------
 /** Cấp chứng nhận khi đạt lần đầu; đạt lại với điểm cao hơn thì cập nhật điểm. Trả về mã tra cứu. */
-export function issueCertificate(userId: number, courseId: number, score: number, total: number): string {
-  const db = open();
-  const old = db.prepare("SELECT code, score, total FROM certificates WHERE user_id = ? AND course_id = ?").get(userId, courseId) as
-    | { code: string; score: number; total: number }
-    | undefined;
+export async function issueCertificate(userId: number, courseId: number, score: number, total: number): Promise<string> {
+  const old = await one<{ code: string; score: number; total: number }>(
+    "SELECT code, score, total FROM certificates WHERE user_id = $1 AND course_id = $2",
+    [userId, courseId]
+  );
   if (old) {
-    if (score / total > old.score / old.total)
-      db.prepare("UPDATE certificates SET score = ?, total = ? WHERE code = ?").run(score, total, old.code);
+    if (score / total > old.score / old.total) await exec("UPDATE certificates SET score = $1, total = $2 WHERE code = $3", [score, total, old.code]);
     return old.code;
   }
-  const u = db.prepare("SELECT u.name, u.cert_name, c.name AS company FROM users u LEFT JOIN companies c ON c.id = u.company_id WHERE u.id = ?").get(userId) as
-    | { name: string; cert_name: string; company: string | null }
-    | undefined;
-  const course = db.prepare("SELECT title FROM courses WHERE id = ?").get(courseId) as { title: string };
+  const u = await one<{ name: string; cert_name: string; company: string | null }>(
+    "SELECT u.name, u.cert_name, c.name AS company FROM users u LEFT JOIN companies c ON c.id = u.company_id WHERE u.id = $1",
+    [userId]
+  );
+  const course = (await one<{ title: string }>("SELECT title FROM courses WHERE id = $1", [courseId]))!;
   const yy = String(new Date().getFullYear()).slice(2);
-  const seq = (db.prepare("SELECT COUNT(*) AS n FROM certificates").get() as { n: number }).n + 1;
-  const code = `SMS-${yy}${String(courseId).padStart(2, "0")}-${String(seq).padStart(4, "0")}${crypto.randomInt(10, 99)}`;
-  db.prepare(
-    "INSERT INTO certificates (code, user_id, course_id, holder_name, course_title, company_name, score, total) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-  ).run(code, userId, courseId, (u?.cert_name || u?.name || "").toUpperCase(), course.title, u?.company ?? "", score, total);
-  return code;
+  // Hai bài đạt cùng lúc có thể ra cùng mã: thử lại với mã khác.
+  for (let i = 0; i < 10; i++) {
+    const seq = (await one<{ n: number }>("SELECT COUNT(*) AS n FROM certificates"))!.n + 1;
+    const code = `SMS-${yy}${String(courseId).padStart(2, "0")}-${String(seq).padStart(4, "0")}${crypto.randomInt(10, 99)}`;
+    const added = await exec(
+      `INSERT INTO certificates (code, user_id, course_id, holder_name, course_title, company_name, score, total)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING`,
+      [code, userId, courseId, (u?.cert_name || u?.name || "").toUpperCase(), course.title, u?.company ?? "", score, total]
+    );
+    if (added) return code;
+    const again = await one<{ code: string }>("SELECT code FROM certificates WHERE user_id = $1 AND course_id = $2", [userId, courseId]);
+    if (again) return again.code;
+  }
+  throw new Error("Không tạo được mã chứng nhận");
 }
 
 export type Certificate = {
   code: string; user_id: number; course_id: number; holder_name: string; course_title: string;
   company_name: string; score: number; total: number; issued_at: string;
 };
-export function getCertificate(code: string): Certificate | null {
-  const r = open().prepare("SELECT * FROM certificates WHERE code = ?").get(code.trim().toUpperCase());
-  return r ? ({ ...r } as unknown as Certificate) : null;
+export async function getCertificate(code: string): Promise<Certificate | null> {
+  return (await one<Certificate>("SELECT * FROM certificates WHERE code = $1", [code.trim().toUpperCase()])) ?? null;
 }
-export function userCertificates(userId: number): Certificate[] {
-  return plain<Certificate>(open().prepare("SELECT * FROM certificates WHERE user_id = ? ORDER BY issued_at DESC").all(userId));
+export function userCertificates(userId: number): Promise<Certificate[]> {
+  return rows<Certificate>("SELECT * FROM certificates WHERE user_id = $1 ORDER BY issued_at DESC", [userId]);
 }
 
 // ---------- Ghi danh ----------
-export function enrolledCourseIds(userId: number): Set<number> {
-  const rows = plain<{ course_id: number }>(open().prepare("SELECT course_id FROM enrollments WHERE user_id = ?").all(userId));
-  return new Set(rows.map((r) => r.course_id));
+export async function enrolledCourseIds(userId: number): Promise<Set<number>> {
+  const r = await rows<{ course_id: number }>("SELECT course_id FROM enrollments WHERE user_id = $1", [userId]);
+  return new Set(r.map((x) => x.course_id));
 }

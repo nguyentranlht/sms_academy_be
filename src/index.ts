@@ -1,8 +1,8 @@
-// SMS Academy – Backend API (Node.js + Express + SQLite).
+// SMS Academy – Backend API (Node.js + Express + PostgreSQL).
 // Frontend (Next.js) gọi các API dưới /api. Mặc định chạy ở cổng 4000.
 import express, { type NextFunction, type Request, type Response } from "express";
 import cookieParser from "cookie-parser";
-import { getDb } from "./lib/db";
+import { initDb } from "./lib/db";
 import auth from "./routes/auth";
 import verify from "./routes/verify";
 import admin from "./routes/admin";
@@ -39,10 +39,19 @@ app.use((_req, res) => res.status(404).json({ error: "Không tìm thấy." }));
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   if ((err as { type?: string }).type === "entity.parse.failed") return res.status(400).json({ error: "Dữ liệu gửi lên không hợp lệ." });
+  // Lỗi PostgreSQL do dữ liệu gửi lên: sai kiểu số/ngày, số quá lớn (22xxx) hoặc trùng dữ liệu (23505).
+  const code = (err as { code?: string }).code;
+  if (code === "23505") return res.status(409).json({ error: "Dữ liệu đã tồn tại." });
+  if (code?.startsWith("22")) return res.status(400).json({ error: "Dữ liệu gửi lên không hợp lệ." });
   console.error(err);
   res.status(500).json({ error: "Lỗi máy chủ. Vui lòng thử lại." });
 });
 
-getDb(); // tạo CSDL + dữ liệu mẫu ngay khi khởi động
 const port = Number(process.env.PORT) || 4000;
-app.listen(port, () => console.log(`SMS Academy API đang chạy: http://localhost:${port}/api`));
+// Tạo bảng + dữ liệu mẫu trước khi nhận yêu cầu.
+initDb()
+  .then(() => app.listen(port, () => console.log(`SMS Academy API đang chạy: http://localhost:${port}/api`)))
+  .catch((e) => {
+    console.error("Không kết nối được PostgreSQL (kiểm tra DATABASE_URL):", e.message || e.code || e);
+    process.exit(1);
+  });
