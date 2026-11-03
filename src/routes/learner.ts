@@ -7,6 +7,7 @@ import {
 import { currentTokenHash, me, rateLimited, requireUser } from "../lib/auth";
 import { canAccess, courseOfLesson, courseOfQuizSession } from "../lib/access";
 import { hashPassword, normalizePhone, passwordProblem, verifyPassword } from "../lib/crypto";
+import { certName } from "../lib/certname";
 
 const r = Router();
 r.use(requireUser);
@@ -175,7 +176,7 @@ r.patch("/account", async (req, res) => {
   if (phone && (await one("SELECT 1 FROM users WHERE phone = $1 AND id <> $2", [phone, u.id])))
     return res.status(409).json({ error: "Số điện thoại này đã thuộc về tài khoản khác." });
   await exec("UPDATE users SET name = $1, cert_name = $2, phone = $3, department = $4 WHERE id = $5", [
-    name, String(b.cert_name || name).trim().toUpperCase().slice(0, 80), phone, String(b.department ?? "").slice(0, 80), u.id,
+    name, certName(String(b.cert_name || name)), phone, String(b.department ?? "").slice(0, 80), u.id,
   ]);
   res.json({ ok: true });
 });

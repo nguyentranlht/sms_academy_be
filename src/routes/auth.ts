@@ -4,6 +4,7 @@ import { exec, NOW, one, rows, tx } from "../lib/db";
 import { hashPassword, normalizePhone, passwordProblem, randomDigits, sha256, verifyPassword } from "../lib/crypto";
 import { createSession, destroySession, findUserByLogin, getUser, rateLimited } from "../lib/auth";
 import { sendMail, showCodesOnScreen } from "../lib/mail";
+import { certName } from "../lib/certname";
 
 const r = Router();
 
@@ -82,7 +83,7 @@ r.post("/register", async (req, res) => {
     if (!(await exec("UPDATE activation_codes SET used = used + 1 WHERE code = $1 AND used < max_uses", [c.code], db))) return null;
     const uid = (await one<{ id: number }>(
       "INSERT INTO users (email, password_hash, name, cert_name, phone, department, company_id) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
-      [email || null, hashPassword(pw), name, name.toUpperCase(), phone, String(b.department ?? "").slice(0, 80), c.company_id],
+      [email || null, hashPassword(pw), name, certName(name), phone, String(b.department ?? "").slice(0, 80), c.company_id],
       db
     ))!.id;
     for (const cid of c.course_ids)

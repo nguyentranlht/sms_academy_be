@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import { Pool, types, type PoolClient, type QueryResult } from "pg";
 import { seedCourses, type SeedCourse } from "./seed";
 import { hashPassword } from "./crypto";
+import { certName } from "./certname";
 
 export const PASS_RATIO = 0.7; // đạt khi đúng ≥ 70%
 export const VIDEO_REQUIRED = 0.95; // phải xem ≥ 95% thời lượng video
@@ -181,7 +182,7 @@ async function seed(c: Db) {
   ], c);
   const u = (await one<{ id: number }>(
     "INSERT INTO users (email, password_hash, name, cert_name, department, company_id, phone) VALUES ($1, $2, $3, $4, $5, $6, '0901234567') RETURNING id",
-    ["hocvien@demo.vn", hashPassword("Hocvien@2026"), "Nguyễn Thị Mai", "NGUYỄN THỊ MAI", "QA", co],
+    ["hocvien@demo.vn", hashPassword("Hocvien@2026"), "Nguyễn Thị Mai", "NGUYEN THI MAI", "QA", co],
     c
   ))!.id;
   for (const id of ids) await exec("INSERT INTO enrollments (user_id, course_id, code) VALUES ($1, $2, $3)", [u, id, "SMS-DEMO-2026"], c);
@@ -445,7 +446,7 @@ export async function issueCertificate(userId: number, courseId: number, score: 
     const added = await exec(
       `INSERT INTO certificates (code, user_id, course_id, holder_name, course_title, company_name, score, total)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING`,
-      [code, userId, courseId, (u?.cert_name || u?.name || "").toUpperCase(), course.title, u?.company ?? "", score, total]
+      [code, userId, courseId, certName(u?.cert_name || u?.name || ""), course.title, u?.company ?? "", score, total]
     );
     if (added) return code;
     const again = await one<{ code: string }>("SELECT code FROM certificates WHERE user_id = $1 AND course_id = $2", [userId, courseId]);
