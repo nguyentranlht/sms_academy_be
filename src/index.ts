@@ -3,6 +3,7 @@
 import express, { type NextFunction, type Request, type Response } from "express";
 import cookieParser from "cookie-parser";
 import { initDb } from "./lib/db";
+import { translateErrors } from "./lib/i18n";
 import auth from "./routes/auth";
 import verify from "./routes/verify";
 import admin from "./routes/admin";
@@ -13,6 +14,7 @@ app.disable("x-powered-by");
 app.set("trust proxy", 1);
 app.use(express.json({ limit: "2mb" }));
 app.use(cookieParser());
+app.use(translateErrors); // lỗi trả về theo ngôn ngữ giao diện (cookie "lang")
 
 // CORS: chỉ cần khi frontend/app điện thoại gọi thẳng từ tên miền khác (đặt CORS_ORIGIN, cách nhau dấu phẩy).
 const origins = (process.env.CORS_ORIGIN ?? "").split(",").map((s) => s.trim()).filter(Boolean);

@@ -6,6 +6,7 @@ import {
 } from "../lib/admin";
 import { deleteCourse, exec, getCourse, listCourses, NOW, one, rows, tx } from "../lib/db";
 import { requireAdmin } from "../lib/auth";
+import { langOf } from "../lib/i18n";
 import { hashPassword, randomDigits } from "../lib/crypto";
 
 const r = Router();
@@ -91,7 +92,11 @@ r.get("/reports", async (req, res) => {
 });
 
 // Xuất CSV (mở trực tiếp bằng Excel, giữ đúng tiếng Việt nhờ BOM UTF-8).
-const vn = (s: string | null) => (s ? new Date(s.replace(" ", "T") + "Z").toLocaleDateString("vi-VN") : "");
+const csvHead = {
+  vi: ["Công ty", "Họ tên", "Số điện thoại", "Email", "Bộ phận", "Khóa học", "Ngày ghi danh", "Bài đã học", "Tổng số bài", "Số lượt thi", "Điểm cao nhất", "Trạng thái", "Mã chứng nhận", "Ngày cấp", "Hoạt động gần nhất"],
+  en: ["Company", "Name", "Phone", "Email", "Department", "Course", "Enrolled", "Lessons done", "Total lessons", "Attempts", "Best score", "Status", "Certificate code", "Issued", "Last activity"],
+};
+const statusEn: Record<string, string> = { "Đạt": "Passed", "Chưa bắt đầu": "Not started", "Đang học": "In progress", "Chờ thi / chưa đạt": "Awaiting quiz / not passed" };
 const cell = (v: unknown) => {
   const s = String(v ?? "");
   const safe = /^[=+\-@\t\r]/.test(s) ? "'" + s : s; // chặn công thức Excel (CSV injection)
@@ -99,15 +104,18 @@ const cell = (v: unknown) => {
 };
 r.get("/reports/export", async (req, res) => {
   const list = await reportRows(num(req.query.company), num(req.query.course));
-  const head = ["Công ty", "Họ tên", "Số điện thoại", "Email", "Bộ phận", "Khóa học", "Ngày ghi danh", "Bài đã học", "Tổng số bài", "Số lượt thi", "Điểm cao nhất", "Trạng thái", "Mã chứng nhận", "Ngày cấp", "Hoạt động gần nhất"];
+  const lang = langOf(req);
+  const head = csvHead[lang];
+  const vn = (s: string | null) => (s ? new Date(s.replace(" ", "T") + "Z").toLocaleDateString(lang === "en" ? "en-GB" : "vi-VN") : "");
+  const status = (x: Parameters<typeof rowStatus>[0]) => (lang === "en" ? statusEn[rowStatus(x)] : rowStatus(x));
   const lines = list.map((x) =>
     [x.company, x.name, x.phone, x.email ?? "", x.department, x.course, vn(x.enrolled_at), x.lessons_done, x.lessons_total, x.attempts,
-      x.best_score != null ? `${x.best_score}/${x.best_total}` : "", rowStatus(x), x.cert_code ?? "", vn(x.cert_date), vn(x.last_activity)]
+      x.best_score != null ? `${x.best_score}/${x.best_total}` : "", status(x), x.cert_code ?? "", vn(x.cert_date), vn(x.last_activity)]
       .map(cell).join(",")
   );
   const date = new Date().toISOString().slice(0, 10);
   res.setHeader("Content-Type", "text/csv; charset=utf-8");
-  res.setHeader("Content-Disposition", `attachment; filename="bao-cao-hoc-vien-${date}.csv"`);
+  res.setHeader("Content-Disposition", `attachment; filename="${lang === "en" ? "learner-report" : "bao-cao-hoc-vien"}-${date}.csv"`);
   res.send("﻿" + [head.map(cell).join(","), ...lines].join("\r\n"));
 });
 
